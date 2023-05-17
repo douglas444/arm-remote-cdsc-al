@@ -1,0 +1,4 @@
+# Compiled Python files
+venv
+/.idea/
+/__pycache__/

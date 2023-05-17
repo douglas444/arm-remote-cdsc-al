@@ -2,19 +2,30 @@ from scipy.spatial.distance import pdist,squareform
 import numpy as np
 import time
 import pandas as pd
+import sys
 import numpy.matlib
+import armstream
+import armstream_cdsc_specifics
 from math import exp,ceil
 from sklearn.metrics import f1_score,accuracy_score,balanced_accuracy_score
 from sklearn.preprocessing import MinMaxScaler
 # Specify the label ratio here
 global label_ratio 
+global arm_interceptor
 label_ratio = 10
+arm_interceptor = armstream.RemoteInterceptor()
 
 
 # Read Data from the csv. files
-def Input():
-    # Read Data from the csv. files
-    sample = pd.read_csv('Syn-1.csv',header=None)
+def Input(dataset_filenames, param_normalize):
+
+    # create an empty dataframe to hold the concatenated data
+    sample = pd.DataFrame()
+
+    # loop through the list of file paths and concatenate each file
+    for file in dataset_filenames.split(';'):
+        df = pd.read_csv(file, header=None)
+        sample = pd.concat([sample, df], axis=0)
 
     [N,L] = np.shape(sample)
     dim = L # Extract the num of dimensions
@@ -24,7 +35,7 @@ def Input():
     # Extract the samples from the data frame
     data = sample.iloc[:,0:dim-1]
     # Normalization Procedure
-    NewData = Data_Pre(data)
+    NewData = Data_Pre(data,param_normalize)
 
 #    label_index = np.argsort(label)
 #    NewData1 = NewData[label_index,:]
@@ -34,16 +45,17 @@ def Input():
     return NewData1,label1
 
 # Max-min Normalization
-def Data_Pre(data):
+def Data_Pre(data, param_normalize):
     [N,L] = np.shape(data)
-    NewData = np.empty((N,L))
-    scaler = MinMaxScaler()
-    scaler.fit(data)
-    NewData = scaler.transform(data)
+    NewData = data.to_numpy()
+    if param_normalize:
+        scaler = MinMaxScaler()
+        scaler.fit(data)
+        NewData = scaler.transform(data)
     return NewData
 # Parameter Specification:
-def ParamSpe(data):
-    Buffersize = 1000 # set the size of the data chunk
+def ParamSpe(data, buffer_size):
+    Buffersize = buffer_size # set the size of the data chunk
     PreStd = [] # Initialize the summary vector of variance for the data stream
     P_Summary = [] # Initialize the cluster summary vector
     PFS = [] # Initialize the summary vector to keep track of density values for cluster centers
@@ -551,7 +563,10 @@ def active_labelquery(num_S, P, sample, temp_labeler, ClusterIndice, num_re):
         con_d1 = squareform(pdist(concate_temp))
         d1 = con_d1[0,1:]
 
-        fetchSize = num_S * len(d1) / np.shape(sample)[0]
+        if np.shape(sample)[0] == 0 and (num_S * len(d1)) == 0:
+            fetchSize = 1
+        else:
+            fetchSize = num_S * len(d1) / np.shape(sample)[0]
         sortIndex1 = np.argsort(d1)
         fet1 = tempcluster[sortIndex1[:ceil(fetchSize * 0.5)]]
         fet1 = fet1.astype(int)
@@ -662,7 +677,7 @@ def classifylabel(subcluster_info, P, P_Summary, sample, ClusterIndice):
             obtained_label[cidx[k]] = hist_label[min_idx[k]]
     return obtained_label
 # Update the clustering model in terms of subcluster information
-def UpdateExistModel(ClusterIndice, Cluster, P_Summary, sample, obtained_label, subcluster_info, num_no,stdData,gamma):
+def UpdateExistModel(ClusterIndice, Cluster, P_Summary, sample, obtained_label, subcluster_info, num_no,stdData,gamma, FetchIndex, temp_labeler, num_me):
     dim = np.shape(Cluster)[1]
     hist_center = P_Summary[:, :dim]
     curr_center = Cluster
@@ -694,6 +709,23 @@ def UpdateExistModel(ClusterIndice, Cluster, P_Summary, sample, obtained_label, 
             curr_submean = curr_submean.reshape(1, dim)
             curr_substd = np.sum(np.square(np.std(subcluster_curr, axis=0))) ** 0.5
             curr_subnum = np.shape(subcluster_curr)[0]
+
+            if num_no != 0 or num_me != 0:
+
+                arm_interceptor.intercept(
+                    armstream_cdsc_specifics.build_arm_interception_context(
+                        samples=sample,
+                        std=curr_substd,
+                        predicted_category=armstream.Category.KNOWN,
+                        local_subcluster_info=subcluster_info,
+                        labeled_indexes=FetchIndex,
+                        chunk_labels=temp_labeler,
+                        samples_indexes=sample_sub,
+                        dim=dim
+                    )
+                )
+
+
             if np.any(np.isin(hist_labels, str(l))):
                 hist_sub = histsub_info[str(l)]
                 hist_submean = hist_sub[:, :dim]
@@ -725,7 +757,7 @@ def UpdateExistModel(ClusterIndice, Cluster, P_Summary, sample, obtained_label, 
         subcluster_info[str(nearest_ind)] = histsub_info
     return subcluster_info
 # Create new clustering models for novel clusters
-def CreateNewModel(ClusterIndice, Cluster, P_Summary, sample, obtained_label, subcluster_info, num_no,stdData,gamma):
+def CreateNewModel(ClusterIndice, Cluster, P_Summary, sample, obtained_label, subcluster_info, num_no,stdData,gamma, FetchIndex, temp_labeler, num_me):
     dim = np.shape(Cluster)[1]
     curr_center = Cluster
 
@@ -743,9 +775,28 @@ def CreateNewModel(ClusterIndice, Cluster, P_Summary, sample, obtained_label, su
             subcluster_novel = sample[novel_clusterind[sample_sub], :]
 
             subcluster_fitness = Fitness_Cal(sample[sample_sub,:],sample[sample_sub,:],stdData,gamma)
-            novel_submean = sample_sub[np.argmax(subcluster_fitness, axis=0)]
+
+            novel_submean = subcluster_novel[np.argmax(subcluster_fitness)]
+            novel_submean = novel_submean.reshape(1, dim)
             novel_substd = np.sum(np.square(np.std(subcluster_novel, axis=0))) ** 0.5
             novel_subnum = np.shape(subcluster_novel)[0]
+
+            if num_no != 0 or num_me != 0:
+
+                arm_interceptor.intercept(
+                    armstream_cdsc_specifics.build_arm_interception_context(
+                        samples=sample,
+                        std=novel_substd,
+                        predicted_category=armstream.Category.NOVELTY,
+                        local_subcluster_info=subcluster_info,
+                        labeled_indexes=FetchIndex,
+                        chunk_labels=temp_labeler,
+                        samples_indexes=sample_sub,
+                        dim=dim
+                    )
+                )
+
+
             insert_info[0, :dim] = novel_submean
             insert_info[0, dim] = novel_substd
             insert_info[0, dim + 1] = novel_subnum
@@ -811,10 +862,28 @@ def leastconfidence(N_active,subreps,sublabelrep, sample, idx_classify):
 
 # ---------------------------Main Function-------------------------#
 if __name__ == '__main__':
-    [data, label] = Input()
+
+    dataset_filename = 'kdd99.csv'
+    buffer_size = 2000
+    param_normalize = True
+
+    if len(sys.argv) > 1:
+        print('arm_interceptor_base_url = ' + str(sys.argv[1]))
+        arm_interceptor.set_base_url(str(sys.argv[1]))
+
+        print('dataset_filename = ' + str(sys.argv[2]))
+        dataset_filename = str(sys.argv[2])
+
+        print('buffer_size = ' + str(sys.argv[3]))
+        buffer_size = int(sys.argv[3])
+
+        print('normalize = ' + str(sys.argv[4]))
+        param_normalize = (int(sys.argv[4]) == 1)
+
+    [data, label] = Input(dataset_filename, param_normalize)
     dim = np.shape(data)[1]
 
-    [BufferSize, P_Summary, T, PFS, PreStd] = ParamSpe(data)
+    [BufferSize, P_Summary, T, PFS, PreStd] = ParamSpe(data, buffer_size)
     
 
     
@@ -1052,18 +1121,27 @@ if __name__ == '__main__':
 
             if num_no == 0:
                 subcluster_info = UpdateExistModel(ClusterIndice, P, P_Summary, sample, obtained_label, subcluster_info,
-                                                   num_no,stdData,gamma)
+                                                   num_no,stdData,gamma, FetchIndex, temp_labeler, num_me)
             else:
                 subcluster_info = UpdateExistModel(ClusterIndice, P, P_Summary, sample, obtained_label, subcluster_info,
-                                                   num_no,stdData,gamma)
+                                                   num_no,stdData,gamma, FetchIndex, temp_labeler, num_me)
                 subcluster_info = CreateNewModel(ClusterIndice, P, P_Summary, sample, obtained_label, subcluster_info,
-                                                 num_no,stdData,gamma)
+                                                 num_no,stdData,gamma, FetchIndex, temp_labeler, num_me)
         P_Summary = ClusterSummary(P,PF,P_Summary,sample,TC,ClusterIndice)
         acc_predlabel = np.concatenate([acc_predlabel, obtained_label])
 
-        F1Hist.append(f1_score(AccLabel, acc_predlabel, average='macro'))
-        BAcc1_Hist.append(balanced_accuracy_score(AccLabel, acc_predlabel))
+        f1_ = f1_score(AccLabel, acc_predlabel, average='macro')
+        bacc_ = balanced_accuracy_score(AccLabel, acc_predlabel)
+
+        F1Hist.append(f1_)
+        BAcc1_Hist.append(bacc_)
         PreStd, PFS = StoreInf(PF, PFS, PreStd, stdData)
+
+        arm_interceptor.peek({
+            't': str(t),
+            'f1': str(f1_),
+            'bacc': str(bacc_)
+        })
 
         merged_cluster = []
         merged_fit = []
@@ -1076,3 +1154,5 @@ if __name__ == '__main__':
     print("The mean of balanced accuracy: ", np.mean(BAcc1_Hist))
     print("The mean of F1-macro score: ", np.mean(F1Hist))
     print("Label ratio: " +str(label_ratio)+"%")
+
+    arm_interceptor.finish()
